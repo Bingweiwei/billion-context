@@ -399,15 +399,18 @@ function seedWal(dir: string): { seed: DatabaseSync; dbPath: string; walSize: nu
 }
 
 // #7156 fix 2 (owner 2026-11-20): the corruption vector is not merely "two
-// writers" — it is a TRUNCATE checkpoint reclaiming the WAL + its -shm index
-// state out from under a peer that still holds a STALE view of it. The
+// writers" — it is a TRUNCATE-class checkpoint reclaiming the WAL + its -shm
+// index state out from under a peer that still holds a STALE view of it. The
 // incident's old sidecar ran exactly this: its shutdown checkpoint while its
 // replacement was already writing. So while a live foreign writer is proven
 // present (the #4175 lockfile), NEITHER the open-time nor the close-time
-// TRUNCATE checkpoint runs — the WAL simply stays until the peer exits and
-// the next clean pass converges it. Nothing is lost by the skip: WAL frames
-// are durable and are replayed/checkpointed by whoever closes cleanly later.
-test("a live foreign writer suppresses the WAL checkpoint (TRUNCATE) on open and close (#7156 fix 2)", { timeout: 30_000 }, async (t) => {
+// checkpoint runs — the WAL simply stays until the peer exits and the next
+// clean pass converges it. Nothing is lost by the skip: WAL frames are
+// durable and are replayed/checkpointed by whoever closes cleanly later.
+// #7674: the automatic checkpoints are now PASSIVE (they never reclaim the
+// file), so this guard is defense-in-depth — the skip is still observable in
+// the logs, which is what this test asserts.
+test("a live foreign writer suppresses the WAL checkpoint (PASSIVE) on open and close (#7156 fix 2, #7674)", { timeout: 30_000 }, async (t) => {
     resetIntegrityCheckStateForTests();
     setIntegritySyncThresholdForTests(null);
     const dir = tmpDir();
@@ -439,14 +442,17 @@ test("a live foreign writer suppresses the WAL checkpoint (TRUNCATE) on open and
         });
         try {
             const store = UnifiedStore.open(dbPath);
-            // TRUNCATE would have reclaimed the seeded frames (wal → 0, then
-            // small bootstrap writes); with the skip the seeded frames must
-            // still be IN the wal, so its size can only have grown.
-            assert.ok(walSizeOf(dbPath) >= seeded.walSize, `open() did NOT truncate the WAL out from under the live peer (now ${walSizeOf(dbPath)}, seeded ${seeded.walSize})`);
+            // #7674: with PASSIVE the file size is no longer the discriminator
+            // (PASSIVE keeps the size whether it ran or was skipped) — the
+            // skip log below is the discriminator. The size check stays as a
+            // sanity invariant: the seeded frames' high-water mark survives.
+            assert.ok(walSizeOf(dbPath) >= seeded.walSize, `open() must not shrink the WAL under the live peer (now ${walSizeOf(dbPath)}, seeded ${seeded.walSize})`);
             assert.ok(skipOpen.length > 0, `open reported the checkpoint skip: ${skipOpen}`);
             store.setKv("test", "key", { x: 1 }); // a committed frame stays in the WAL
             store.close();
-            assert.ok(statSync(dbPath + "-wal").size > 0, "close() did NOT run the final checkpoint under a live peer — the WAL stays for the peer's next clean pass");
+            // #7674: PASSIVE keeps the file size either way — the skip log
+            // (below) is the discriminator that the close pass did not run.
+            assert.ok(statSync(dbPath + "-wal").size > 0, "the -wal file survives close() under a live peer (seed connection still open)");
             assert.ok(skipClose.length > 0, `close reported the checkpoint skip: ${skipClose}`);
             assert.ok(skipOpen.includes(String(holder.pid)), "the skip log names the peer pid");
         } finally {
@@ -454,17 +460,38 @@ test("a live foreign writer suppresses the WAL checkpoint (TRUNCATE) on open and
         }
         seed?.close();
 
-        // ---- control: no foreign writer → both checkpoints run ----
+        // ---- control: no foreign writer → both checkpoints run (PASSIVE since #7674) ----
         const dir2 = tmpDir();
         t.after(() => rmSync(dir2, { recursive: true, force: true }));
         seed = seedWal(dir2).seed;
         const db2 = join(dir2, "index.db");
-        const store2 = UnifiedStore.open(db2);
-        assert.equal(walSizeOf(db2), 0, "open() ran the TRUNCATE checkpoint (fast path preserved without a peer)");
-        store2.setKv("test", "key", { x: 1 });
-        assert.ok(walSizeOf(db2) > 0, "the committed frame is in the WAL before close");
-        store2.close();
-        assert.equal(walSizeOf(db2), 0, "close() converged the WAL (single-writer behavior unchanged)");
+        // #7674: with PASSIVE the file size is no longer the discriminator
+        // (PASSIVE keeps the size whether it ran or was skipped, and never
+        // truncates the file — no floor reclaim). The discriminator that the
+        // checkpoint RAN is the ABSENCE of the skip log: the skip log is only
+        // emitted when a live foreign writer is present. The size checks stay
+        // as sanity invariants.
+        skipOpen = "";
+        skipClose = "";
+        setLogCapture((level, m) => {
+            const msg = String(m);
+            if (level === "info" && msg.includes("live foreign writer pid")) {
+                if (msg.includes("on open")) skipOpen = msg;
+                if (msg.includes("on close")) skipClose = msg;
+            }
+        });
+        try {
+            const store2 = UnifiedStore.open(db2);
+            assert.ok(walSizeOf(db2) > 0, "open() must NOT truncate the WAL (PASSIVE, no floor reclaim)");
+            assert.equal(skipOpen, "", `open() ran the PASSIVE checkpoint (no skip log); skipOpen=${skipOpen}`);
+            store2.setKv("test", "key", { x: 1 });
+            assert.ok(walSizeOf(db2) > 0, "the committed frame is in the WAL before close");
+            store2.close();
+            assert.ok(walSizeOf(db2) > 0, "close() must NOT truncate the WAL (PASSIVE, no floor reclaim)");
+            assert.equal(skipClose, "", `close() ran the PASSIVE checkpoint (no skip log); skipClose=${skipClose}`);
+        } finally {
+            setLogCapture(null);
+        }
         // seed is closed by the outer finally.
     } finally {
         seed?.close();

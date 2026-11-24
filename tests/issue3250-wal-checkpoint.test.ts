@@ -12,16 +12,16 @@
  * replay time after SIGKILL/power loss.
  *
  * Fix under test (src/storage/schema.ts + src/storage/store.ts):
- *   1. `PRAGMA journal_size_limit` (default -1 / unlimited, tunable via
+ *   1. `PRAGMA journal_size_limit` (default 8 MiB, tunable via
  *      storage.walJournalSizeLimitBytes / BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES,
  *      resolved in src/knobs.ts) — when a positive cap is configured, every
- *      COMPLETED checkpoint truncates the file back to the cap; with the
- *      default (-1) the engine does no implicit floor-reclaim and the WAL
- *      sits at its historical high-water mark (field: 55 MiB flat — bounded,
- *      harmless). #7674: the 8 MiB default made the engine truncate the WAL
- *      internally after every completed checkpoint — a TRUNCATE-class reclaim
- *      that moves the WAL file and its -shm index out from under every peer
- *      connection, with no JS-side guard.
+ *      COMPLETED checkpoint truncates the file back to the cap. #7674: that
+ *      engine-internal truncation is a TRUNCATE-class reclaim that moves the
+ *      WAL file and its -shm index out from under every peer connection, with
+ *      no JS-side guard — Part 1 of the #7674 fix (default → -1, the engine
+ *      stops all implicit reclaims; the WAL then sits at its historical
+ *      high-water mark, field: 55 MiB flat — bounded, harmless) is pending
+ *      the owner's decision and will land in this PR.
  *   2. one-shot `wal_checkpoint(PASSIVE)` on UnifiedStore.open (replays the
  *      tail an unclean exit left behind — same convergence, no floor reclaim)
  *      and before close (replays the tail; the file keeps its high-water mark);
@@ -340,11 +340,14 @@ test("#3250: a configured cap flows open() → journal_size_limit (custom limit 
             `WAL must be truncated to the configured cap at the autocheckpoint (left ${walSize(dir)} bytes, cap ${customCap})`,
         );
         assert.equal(store.getMessages("big").length, 120, "all burst rows must land");
-        // #7674: a clean exit uses PASSIVE (no floor reclaim) — the WAL file
-        // keeps its high-water mark whatever the cap.
+        // #7674: a clean exit uses PASSIVE (no floor reclaim). Here the store
+        // is the ONLY connection, so the last-connection close deletes the
+        // -wal file entirely (standard SQLite cleanup) — the no-floor-reclaim
+        // property under a live peer is pinned by the open/close tests above.
+        // Either way: nothing larger than the cap plateau may survive.
         store.close();
         store = undefined;
-        assert.ok(walSize(dir) > 0, `close() must NOT truncate the WAL (PASSIVE, no floor reclaim) — left ${walSize(dir)} bytes`);
+        assert.ok(walSize(dir) <= customCap + CUSTOM_CAP_SLACK, `close() must not leave a WAL larger than the cap plateau (left ${walSize(dir)} bytes)`);
     } finally {
         store?.close();
         rmBestEffort(dir);
