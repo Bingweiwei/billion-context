@@ -78,7 +78,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, resolveRecordedPassthrough, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, resolveRecordedPassthrough, ZONE_PORT_BASE, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 import { parseLauncherModelWindows, parseLauncherModelMaxOutputs } from "./server/context-window.js";
@@ -5342,7 +5342,7 @@ async function resolveWedgedSameLaneHolder(
 }
 
 /** #7156: the last gate before the spawn ladder — never open a second
- *  SAME-LANE writer behind a live predecessor.
+ *  writer behind a live predecessor on the target port.
  *
  *  Background: SQLite's multi-process mode is turn-taking — healthy peers
  *  coordinate through the WAL index and never corrupt each other (270/270
@@ -5369,6 +5369,15 @@ async function resolveWedgedSameLaneHolder(
  *        process actually exiting is (#5167: a drain can outlive its
  *        listener). Wait, bounded, for real death; then spawn.
  *    process dead (listener either way) → gone: spawn.
+ *
+ *  #7676: a LIVE no-lane instance (manual `bili start`) on the launch's target
+ *  port is ALSO a predecessor — it writes the same shared index.db. It is
+ *  neither attachable (no lane identity) nor wedge-takeover-eligible (it's the
+ *  user's own process — no automatic kills), so the gate REFUSES with an
+ *  actionable error naming the pid + origin and giving the two remedies: give
+ *  the manual daemon its own port zone via `-p` / a different `BILI_PORT_ZONE`,
+ *  or `kill <pid>`. Same-lane behavior (healthy attach / wedge takeover /
+ *  drain grace) is unchanged.
  */
 async function quiesceSameLanePredecessor(
     probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
@@ -5383,18 +5392,35 @@ async function quiesceSameLanePredecessor(
     if (lane === undefined) return;
     // Cheap prefilter — #1660: never touch the sticky zone resolver on a
     // bring-up where nothing same-lane is alive at all.
-    if (!probed.some((c) => c.inst.lane === lane && !isUserZoneInstance(c.inst))) return;
+    // #7676: also check for no-lane instances (manual bili start) — they write
+    // the same shared index.db and are predecessors too.
+    if (!probed.some((c) => (c.inst.lane === lane || c.inst.lane === undefined) && isPidAlive(c.inst.pid))) return;
     const targetPort = resolveTargetPort();
     if (targetPort === undefined) return;
     const survivors = probed.filter(
-        (c) => c.inst.lane === lane
-            && !isUserZoneInstance(c.inst)
+        (c) => (c.inst.lane === lane || c.inst.lane === undefined)
             && c.inst.port === targetPort
             && isPidAlive(c.inst.pid),
     );
     if (survivors.length === 0) return;
     for (const s of survivors) {
         if (!isPidAlive(s.inst.pid)) continue; // raced to death between the filter and now
+        // #7676: a no-lane instance (manual bili start) on the target port is a
+        // predecessor — it writes the same shared index.db. It is neither
+        // attachable (no lane identity) nor wedge-takeover-eligible (it's the
+        // user's own process — no automatic kills), so refuse with an actionable
+        // error instead of laddering to +1 and drifting a second writer.
+        // Only applies to LANE-zone ports (>= ZONE_PORT_BASE): a lane launch
+        // explicitly targeting the USER zone (8787) is a user-directed port
+        // choice (#2877: spawn its own, don't ride the manual daemon) — allow.
+        if (s.inst.lane === undefined) {
+            if (targetPort >= ZONE_PORT_BASE) {
+                throw new Error(
+                    `bili: refusing to spawn a second writer — a manual daemon (pid ${s.inst.pid}, origin ${s.inst.origin}) is already on port ${targetPort}, which is this lane's target port. Opening a second proxy over the same shared session store corrupts the index (#7156). Give the manual daemon its own port zone (start it with -p <port> or a different BILI_PORT_ZONE), or stop it now: kill ${s.inst.pid}`,
+                );
+            }
+            continue; // user-zone target: #2877 spawn-its-own behavior
+        }
         const listening = await isConnectable(s.inst.origin);
         if (listening) {
             const healthy = await fetchHealthInfoNoReuse(s.inst.origin);
