@@ -12,21 +12,23 @@
  * replay time after SIGKILL/power loss.
  *
  * Fix under test (src/storage/schema.ts + src/storage/store.ts):
- *   1. `PRAGMA journal_size_limit` (default 8 MiB, tunable via
- *      storage.walJournalSizeLimitBytes / BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES,
- *      resolved in src/knobs.ts) — every COMPLETED checkpoint now truncates the
- *      file back to the cap;
- *   2. one-shot `wal_checkpoint(TRUNCATE)` on UnifiedStore.open (converges
+ *   1. `PRAGMA journal_size_limit` (default 0 = unlimited per #7676, tunable
+ *      via storage.walJournalSizeLimitBytes / BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES,
+ *      resolved in src/knobs.ts) — when a positive cap is set, every COMPLETED
+ *      checkpoint truncates the file back to the cap;
+ *   2. one-shot `wal_checkpoint(PASSIVE)` on UnifiedStore.open (converges
  *      residue an unclean exit left behind — shortens the NEXT recovery)
- *      and before close (clean exit leaves nothing to replay);
+ *      and before close (clean exit leaves nothing to replay). #7676: PASSIVE
+ *      (not TRUNCATE) — safe under a live peer; the engine's implicit
+ *      truncation (journal_size_limit) was the corruption vector;
  *   3. a PASSIVE checkpoint every WAL_CHECKPOINT_EVERY_INGESTS successful
  *      ingests — reclamation keeps happening under continuous ingest even
  *      when the autocheckpoint window never appears; never blocks, failures
  *      are logged and forgotten.
  *
  * Every test below is a RED/GREEN discriminator: on the pre-fix tree the
- * asserted size is the unreclaimed high-water mark; with the fix the file
- * converges to the cap (or zero).
+ * asserted size is the unreclaimed high-water mark; with the fix the data
+ * is intact after open/close (WAL size assertions removed per #7676).
  */
 
 import { test } from "node:test";
@@ -155,7 +157,7 @@ const CAP_SLACK = 4 * KiB;
  */
 const CUSTOM_CAP_SLACK = 256 * KiB;
 
-test("#3250: close() converges the WAL so a clean exit leaves nothing to replay", () => {
+test("#3250/#7676: close() checkpoints the WAL (PASSIVE), data intact", () => {
     const dir = tmpdir("bili-3250-close-");
     let pin: ReturnType<typeof rawOpen> | undefined;
     let store: UnifiedStore | undefined;
@@ -165,7 +167,7 @@ test("#3250: close() converges the WAL so a clean exit leaves nothing to replay"
         // A foreign connection keeps the database (and thus the -wal file)
         // alive after `store` closes — otherwise a clean last-connection
         // close would delete the WAL file and mask whether close() did the
-        // converging work itself.
+        // checkpoint work itself.
         pin = rawOpen(dir);
         store = UnifiedStore.open(indexDb(dir));
         ingest(store, "s1", 1 * MiB, 40);
@@ -174,10 +176,9 @@ test("#3250: close() converges the WAL so a clean exit leaves nothing to replay"
 
         store.close();
         storeClosed = true;
-        assert.ok(
-            walSize(dir) <= CAP_SLACK,
-            `close() must have truncated the WAL (left ${walSize(dir)} bytes — un-reclaimed high-water mark)`,
-        );
+        // #7676: close() is now PASSIVE (no floor reclaim) — the WAL file
+        // stays at its high-water mark (bounded, harmless). The frames are
+        // moved into the main db; the data must be intact on reopen.
 
         check = UnifiedStore.open(indexDb(dir));
         for (const id of ["s1", "s2"]) {
@@ -191,7 +192,7 @@ test("#3250: close() converges the WAL so a clean exit leaves nothing to replay"
     }
 });
 
-test("#3250: open() converges the WAL an unclean exit left behind, data intact", () => {
+test("#3250/#7676: open() checkpoints the WAL (PASSIVE), data intact", () => {
     const dir = tmpdir("bili-3250-open-");
     let dirty: UnifiedStore | undefined;
     let late: UnifiedStore | undefined;
@@ -204,10 +205,9 @@ test("#3250: open() converges the WAL an unclean exit left behind, data intact",
         assert.ok(walSize(dir) > 0, "the unclean exit must have left WAL frames behind");
 
         late = UnifiedStore.open(indexDb(dir));
-        assert.ok(
-            walSize(dir) <= CAP_SLACK,
-            `open() must have checkpointed the residue (left ${walSize(dir)} bytes — next crash would replay it all)`,
-        );
+        // #7676: open() is now PASSIVE (no floor reclaim) — the WAL file
+        // stays at its high-water mark (bounded, harmless). The frames are
+        // moved into the main db; the data must be intact.
         for (const id of ["s1", "s2"]) {
             assert.equal(late.getMessages(id).length, 40, `${id} message rows must survive the open-time checkpoint`);
         }
@@ -218,7 +218,7 @@ test("#3250: open() converges the WAL an unclean exit left behind, data intact",
     }
 });
 
-test("#3250: a save burst past the cap comes back under the cap at the next cadence tick", () => {
+test("#3250/#7676: a save burst leaves the WAL at its high-water mark, data intact", () => {
     const dir = tmpdir("bili-3250-burst-");
     let store: UnifiedStore | undefined;
     try {
@@ -227,19 +227,13 @@ test("#3250: a save burst past the cap comes back under the cap at the next cade
         // frames it just wrote while it is still the last writer (verified:
         // same-conn PASSIVE right after the commit reclaims nothing) — so the
         // burst residue sitting in the WAL is normal WAL behavior, not the bug.
-        // The #3250 defect is what happens NEXT: without journal_size_limit,
-        // every later checkpoint resets the write offset but never shrinks the
-        // file, so the ~12 MiB high-water mark persists for the life of the
-        // process. With the limit, the first COMPLETED checkpoint after newer
-        // writes truncate the file back to the cap — here driven by the
-        // periodic PASSIVE at the CHECKPOINT_EVERY_N-th ingest.
+        // #7676: with journal_size_limit=0 (unlimited), the engine no longer
+        // truncates the WAL internally. The WAL stays at its high-water mark
+        // (bounded, harmless). The frames are moved into the main db by the
+        // periodic PASSIVE checkpoint; the data must be intact.
         ingest(store, "big", 12 * MiB, 480);
         assert.ok(walSize(dir) > 0, "the burst must have left frames in the WAL");
         for (let i = 2; i <= CHECKPOINT_EVERY_N; i++) ingest(store, `small${i}`, 1 * MiB, 40);
-        assert.ok(
-            walSize(dir) <= WAL_CAP + CAP_SLACK,
-            `WAL must be truncated to the cap by the cadence checkpoint (left ${walSize(dir)} bytes, cap ${WAL_CAP})`,
-        );
         assert.equal(store.getMessages("big").length, 480, "all burst rows must land");
         assert.equal(store.getMessages(`small${CHECKPOINT_EVERY_N}`).length, 40, "all follow-up rows must land");
     } finally {
@@ -248,7 +242,7 @@ test("#3250: a save burst past the cap comes back under the cap at the next cade
     }
 });
 
-test("#3250: pinned reader lifecycle — growth while pinned, reclamation after release", () => {
+test("#3250/#7676: pinned reader lifecycle — growth while pinned, data intact after release", () => {
     const dir = tmpdir("bili-3250-pin-");
     let store: UnifiedStore | undefined;
     let reader: ReturnType<typeof rawOpen> | undefined;
@@ -274,15 +268,11 @@ test("#3250: pinned reader lifecycle — growth while pinned, reclamation after 
         reader.close();
         reader = undefined;
 
-        // Drain enough ingests past the checkpoint cadence: the first
-        // COMPLETED checkpoint after the release truncates the file back to
-        // the cap (autocheckpoint or the periodic PASSIVE — either way the
-        // reclamation now actually happens).
+        // #7676: with journal_size_limit=0 (unlimited), the engine no longer
+        // truncates the WAL internally. The WAL stays at its high-water mark
+        // (bounded, harmless). The frames are moved into the main db by the
+        // periodic PASSIVE checkpoint; the data must be intact.
         for (let i = 0; i < 2 * CHECKPOINT_EVERY_N; i++) ingest(store, `post${i}`, 100 * KiB, 4);
-        assert.ok(
-            walSize(dir) <= WAL_CAP + CAP_SLACK,
-            `WAL must come back under the cap after the reader released (left ${walSize(dir)} bytes, cap ${WAL_CAP})`,
-        );
 
         const view = loadLegacyView({
             session: (() => {
@@ -314,8 +304,8 @@ test("#3250: a configured cap flows open() → journal_size_limit (custom limit 
         assert.ok(walSize(dir) > customCap, "the burst must overshoot the custom cap in-flight");
         // ...and once the WAL crosses the autocheckpoint window (1000 pages), the
         // writer's own completed checkpoint truncates back to the CONFIGURED cap,
-        // not the 8 MiB default: with the default the file would sit at the
-        // ~4.4 MiB high-water mark here, never touching 1 MiB. (A lone writer's
+        // not the 0 default: with the default the file would sit at its
+        // high-water mark here, never touching 1 MiB. (A lone writer's
         // cadence-tick PASSIVE can backfill without shrinking the file — its own
         // tail read-lock blocks the truncate — so the autocheckpoint plateau is
         // the observable proof the configured value reached the pragma.)
@@ -325,10 +315,11 @@ test("#3250: a configured cap flows open() → journal_size_limit (custom limit 
             `WAL must be truncated to the configured cap at the autocheckpoint (left ${walSize(dir)} bytes, cap ${customCap})`,
         );
         assert.equal(store.getMessages("big").length, 120, "all burst rows must land");
-        // A clean exit converges to zero whatever the cap.
+        // #7676: close() is now PASSIVE (no floor reclaim) — the WAL file
+        // stays at its high-water mark (bounded, harmless). The frames are
+        // moved into the main db; the data must be intact on reopen.
         store.close();
         store = undefined;
-        assert.ok(walSize(dir) <= CAP_SLACK, `close() must converge the WAL (left ${walSize(dir)} bytes)`);
     } finally {
         store?.close();
         rmBestEffort(dir);

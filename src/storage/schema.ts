@@ -85,17 +85,18 @@
 //        older build opening a v11 file ignores the extra indexes.
 export const STORAGE_SCHEMA_VERSION = 11;
 
-/** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
- *  auto checkpoints move frames into the main db and reset the write offset
- *  but NEVER shrink the WAL file — without this limit a long-lived process's
- *  index.db-wal stays at its historical high-water mark forever (field:
- *  55 MiB flat). With it, every completed checkpoint truncates the file back
- *  to the cap. 8 MiB sits well above any single-save burst while keeping
- *  disk use and crash-recovery replay bounded. Per-connection setting: each
- *  process that opens the shared index applies its own copy (#2671 topology).
- *  Tunable since #3250 via storage.walJournalSizeLimitBytes /
- *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES (resolved by src/knobs.ts). */
-export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
+/** #3250: default cap for `journal_size_limit` (see STORAGE_PRAGMAS).
+ *  #7676: the default is now 0 (unlimited — the SQLite default). The 8 MiB
+ *  cap made the ENGINE truncate the WAL internally after every completed
+ *  checkpoint, bypassing the #7156 JS-side guard: a live peer holding a STALE
+ *  view of the reclaimed index then writes into freed offsets — the #7156
+ *  corruption shape. With 0 the engine stops doing implicit floor-reclaims;
+ *  the WAL file sits at its historical high-water mark (field: 55 MiB flat —
+ *  bounded, harmless). The knob (storage.walJournalSizeLimitBytes /
+ *  BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES) stays for operators who want
+ *  the cap (resolved by src/knobs.ts). Per-connection setting: each process
+ *  that opens the shared index applies its own copy (#2671 topology). */
+export const WAL_JOURNAL_SIZE_LIMIT = 0;
 
 /** Connection pragmas for every index.db opener. The journal cap is
  *  per-opener (see WAL_JOURNAL_SIZE_LIMIT); the default list below is what

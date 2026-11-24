@@ -390,8 +390,8 @@ test("resolveStorageMode file tier: storage.unified applies when the env is abse
     assert.equal(resolveStorageMode({ BILI_STORAGE_UNIFIED: "legacy" }, "full"), "legacy");
 });
 
-test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file tier, default (#3250)", () => {
-    const DEFAULT = 8 * 1024 * 1024; // contract literal, mirrors tests/issue3250-wal-checkpoint.test.ts
+test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file tier, default (#3250/#7676)", () => {
+    const DEFAULT = 0; // #7676: default is now 0 (unlimited) — the engine no longer truncates the WAL internally
     assert.equal(resolveStorageWalJournalSizeLimit({}), DEFAULT, "absent everywhere must give the default cap");
     assert.equal(
         resolveStorageWalJournalSizeLimit({ BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES: "67108864" }, DEFAULT),
