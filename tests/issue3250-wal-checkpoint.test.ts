@@ -12,13 +12,21 @@
  * replay time after SIGKILL/power loss.
  *
  * Fix under test (src/storage/schema.ts + src/storage/store.ts):
- *   1. `PRAGMA journal_size_limit` (default 8 MiB, tunable via
+ *   1. `PRAGMA journal_size_limit` (default -1 / unlimited, tunable via
  *      storage.walJournalSizeLimitBytes / BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES,
- *      resolved in src/knobs.ts) — every COMPLETED checkpoint now truncates the
- *      file back to the cap;
- *   2. one-shot `wal_checkpoint(TRUNCATE)` on UnifiedStore.open (converges
- *      residue an unclean exit left behind — shortens the NEXT recovery)
- *      and before close (clean exit leaves nothing to replay);
+ *      resolved in src/knobs.ts) — when a positive cap is configured, every
+ *      COMPLETED checkpoint truncates the file back to the cap; with the
+ *      default (-1) the engine does no implicit floor-reclaim and the WAL
+ *      sits at its historical high-water mark (field: 55 MiB flat — bounded,
+ *      harmless). #7674: the 8 MiB default made the engine truncate the WAL
+ *      internally after every completed checkpoint — a TRUNCATE-class reclaim
+ *      that moves the WAL file and its -shm index out from under every peer
+ *      connection, with no JS-side guard.
+ *   2. one-shot `wal_checkpoint(PASSIVE)` on UnifiedStore.open (replays the
+ *      tail an unclean exit left behind — same convergence, no floor reclaim)
+ *      and before close (replays the tail; the file keeps its high-water mark);
+ *      #7674: TRUNCATE was the corruption vector in the kill-9 handover
+ *      topology.
  *   3. a PASSIVE checkpoint every WAL_CHECKPOINT_EVERY_INGESTS successful
  *      ingests — reclamation keeps happening under continuous ingest even
  *      when the autocheckpoint window never appears; never blocks, failures
@@ -26,7 +34,8 @@
  *
  * Every test below is a RED/GREEN discriminator: on the pre-fix tree the
  * asserted size is the unreclaimed high-water mark; with the fix the file
- * converges to the cap (or zero).
+ * stays at its high-water mark (no floor reclaim) or converges to the
+ * configured cap (when one is set).
  */
 
 import { test } from "node:test";
@@ -155,7 +164,7 @@ const CAP_SLACK = 4 * KiB;
  */
 const CUSTOM_CAP_SLACK = 256 * KiB;
 
-test("#3250: close() converges the WAL so a clean exit leaves nothing to replay", () => {
+test("#3250: close() replays the WAL tail (PASSIVE) and leaves the file at its high-water mark", () => {
     const dir = tmpdir("bili-3250-close-");
     let pin: ReturnType<typeof rawOpen> | undefined;
     let store: UnifiedStore | undefined;
@@ -165,7 +174,7 @@ test("#3250: close() converges the WAL so a clean exit leaves nothing to replay"
         // A foreign connection keeps the database (and thus the -wal file)
         // alive after `store` closes — otherwise a clean last-connection
         // close would delete the WAL file and mask whether close() did the
-        // converging work itself.
+        // replaying work itself.
         pin = rawOpen(dir);
         store = UnifiedStore.open(indexDb(dir));
         ingest(store, "s1", 1 * MiB, 40);
@@ -174,9 +183,12 @@ test("#3250: close() converges the WAL so a clean exit leaves nothing to replay"
 
         store.close();
         storeClosed = true;
+        // #7674: close() uses PASSIVE (no floor reclaim) — the WAL file keeps
+        // its high-water mark. The data must still be replayed into the main
+        // db (the next open sees the rows).
         assert.ok(
-            walSize(dir) <= CAP_SLACK,
-            `close() must have truncated the WAL (left ${walSize(dir)} bytes — un-reclaimed high-water mark)`,
+            walSize(dir) > 0,
+            `close() must NOT truncate the WAL (PASSIVE, no floor reclaim) — left ${walSize(dir)} bytes`,
         );
 
         check = UnifiedStore.open(indexDb(dir));
@@ -191,7 +203,7 @@ test("#3250: close() converges the WAL so a clean exit leaves nothing to replay"
     }
 });
 
-test("#3250: open() converges the WAL an unclean exit left behind, data intact", () => {
+test("#3250: open() replays the WAL tail an unclean exit left behind (PASSIVE), data intact", () => {
     const dir = tmpdir("bili-3250-open-");
     let dirty: UnifiedStore | undefined;
     let late: UnifiedStore | undefined;
@@ -204,9 +216,12 @@ test("#3250: open() converges the WAL an unclean exit left behind, data intact",
         assert.ok(walSize(dir) > 0, "the unclean exit must have left WAL frames behind");
 
         late = UnifiedStore.open(indexDb(dir));
+        // #7674: open() uses PASSIVE (no floor reclaim) — the WAL file keeps
+        // its high-water mark. The data must still be replayed into the main
+        // db (the next open sees the rows).
         assert.ok(
-            walSize(dir) <= CAP_SLACK,
-            `open() must have checkpointed the residue (left ${walSize(dir)} bytes — next crash would replay it all)`,
+            walSize(dir) > 0,
+            `open() must NOT truncate the WAL (PASSIVE, no floor reclaim) — left ${walSize(dir)} bytes`,
         );
         for (const id of ["s1", "s2"]) {
             assert.equal(late.getMessages(id).length, 40, `${id} message rows must survive the open-time checkpoint`);
@@ -325,10 +340,11 @@ test("#3250: a configured cap flows open() → journal_size_limit (custom limit 
             `WAL must be truncated to the configured cap at the autocheckpoint (left ${walSize(dir)} bytes, cap ${customCap})`,
         );
         assert.equal(store.getMessages("big").length, 120, "all burst rows must land");
-        // A clean exit converges to zero whatever the cap.
+        // #7674: a clean exit uses PASSIVE (no floor reclaim) — the WAL file
+        // keeps its high-water mark whatever the cap.
         store.close();
         store = undefined;
-        assert.ok(walSize(dir) <= CAP_SLACK, `close() must converge the WAL (left ${walSize(dir)} bytes)`);
+        assert.ok(walSize(dir) > 0, `close() must NOT truncate the WAL (PASSIVE, no floor reclaim) — left ${walSize(dir)} bytes`);
     } finally {
         store?.close();
         rmBestEffort(dir);
