@@ -3669,9 +3669,26 @@ export class UnifiedStore {
             // the main db and the WAL file truncates back to the cap
             // (#3250 discipline). A busy checkpoint loses nothing — the next
             // batch retries.
-            try {
-                this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-            } catch { /* best-effort; retried by the next batch */ }
+            // #7156/#7681: a TRUNCATE checkpoint reclaims the WAL + its -shm
+            // index state out from under every peer; a live peer holding a
+            // STALE view of that index then writes from the invalidated view
+            // and its frames land in reclaimed offsets (the #7156 corruption
+            // shape). The busy-catch below does NOT protect against this — the
+            // shape needs the TRUNCATE to succeed while a live peer holds a
+            // stale view (peer not in a write tx at that instant). Skip the
+            // TRUNCATE while a live foreign writer is present: the zero-ref
+            // deletes above still commit, and the WAL converges on the next
+            // gc/vacuum after the peer exits. Same precedent as the open()/
+            // close() TRUNCATE guard (#7156 fix 2). Re-checked per batch: the
+            // sweep can run long and the peer set changes between batches.
+            const foreignWriter = this.activeForeignWriter();
+            if (foreignWriter === null) {
+                try {
+                    this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+                } catch { /* best-effort; retried by the next batch */ }
+            } else {
+                loggerLog("info", `[#7156] gc: skipping the between-batch WAL checkpoint (TRUNCATE) (batch ${batchNo}): live foreign writer pid ${foreignWriter} present — truncating the WAL index under a live peer risks the #7156 corruption shape; the zero-ref deletes still commit and the WAL converges on the next gc/vacuum after the peer exits`);
+            }
             if (batchNo % 10 === 0 || hashes.length < batchSize) {
                 loggerLog("info", `[#4796] gc: collected ${deleted} zero-ref content rows so far (batch ${batchNo})`);
             }
